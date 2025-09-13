@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+DidurAnalyticBot - SEC -> Telegram alerts
+Tracks Form 3 / 4 / 13D / 13G / 13D/A filings.
+Sends alert if transaction >= $5,000,000 and price between $0.005 and $80.
+Checks every 30 minutes.
+Message format: Company (Ticker) — Amount — Buyer — Form — Link
+"""
+
+import os
+import time
+import logging
+import hashlib
+from datetime import datetime, timedelta, timezone
+import requests
+import sqlite3
+
+# ===== CONFIG =====
+BOT_TOKEN = "8252221130:AAG_qLvJYv5B_UB7NPC8a2_Z34LQMBpSvZA"
+CHAT_ID = "123456789"  # Твій Telegram Chat ID
+SEC_API_KEY = "de34ea802d680096354611a78c3eb8365f6759e85032ec0302cf9b9a7650246f"
+CHECK_INTERVAL_SECONDS = 30 * 60  # кожні 30 хв
+MIN_AMOUNT_USD = 5_000_000
+MIN_PRICE = 0.005
+MAX_PRICE = 80.0
+FORM_TYPES = ["3", "4", "13D", "13G", "13D/A"]
+USER_AGENT = "DidurAnalyticBot/1.0 (contact@example.com)"
+
+# ===== LOGGING =====
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("didurbot")
+
+# ===== sqlite for dedupe =====
+DB_PATH = "seen.db"
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS seen(
+            key TEXT PRIMARY KEY,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+def seen_insert(conn, key):
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO seen (key, created_at) VALUES (?, ?)", (key, datetime.utcnow().isoformat()))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+# ===== HELPERS =====
+def sec_api_query():
+    url = "https://api.sec-api.io/query"
+    query = {
+        "query": {
+            "query_string": {
+                "query": " OR ".join([f'formType:\"{ft}\"' for ft in FORM_TYPES])
+            }
+        },
+        "from": "0",
+        "size": "200",
+        "sort": [{"filedAt": {"order": "desc"}}]
+    }
+    headers = {
+        "Authorization": f"Bearer {SEC_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT
+    }
+    r = requests.post(url, json=query, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def safe_float(x):
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).replace(",", "").replace("$", "")
+        return float(s)
+    except Exception:
+        return None
+
+def extract_transactions(filing):
+    txs = []
+    src = filing.get("_source") or filing
+    possible_tx_fields = ["transactions", "transaction", "insiderTransactions", "transactionObjects"]
+    for f in possible_tx_fields:
+        if f in src and isinstance(src[f], list):
+            for t in src[f]:
+                shares = safe_float(t.get("transactionShares") or t.get("shares") or t.get("amount"))
+                price = safe_float(t.get("transactionPrice") or t.get("price") or t.get("perSharePrice"))
+                owner = t.get("ownerName") or t.get("reportingOwner") or t.get("owner")
+                txs.append({"shares": shares, "price": price, "owner": owner})
+            return txs
+    if "transactionShares" in src or "transactionPrice" in src:
+        txs.append({
+            "shares": safe_float(src.get("transactionShares")),
+            "price": safe_float(src.get("transactionPrice")),
+            "owner": src.get("reportingOwnerName") or src.get("ownerName")
+        })
+    return txs
+
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text}
+    r = requests.post(url, json=payload, timeout=15)
+    try:
+        r.raise_for_status()
+    except Exception:
+        logger.exception("Telegram send failed: %s %s", r.status_code, r.text)
+
+def process_hits(hits, since_dt, conn):
+    sent = 0
+    for h in hits:
+        src = h.get("_source") or h
+        filedAt_str = src.get("filedAt") or src.get("fileDate")
+        if not filedAt_str:
+            continue
+        try:
+            filedAt = datetime.fromisoformat(filedAt_str.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if filedAt < since_dt:
+            continue
+
+        company = src.get("companyName") or src.get("issuerName") or "Unknown Company"
+        ticker = src.get("ticker") or src.get("symbol") or "UNK"
+        form_type = src.get("formType") or src.get("form") or "UNK"
+        filing_url = src.get("link") or src.get("url") or src.get("fileUrl") or ""
+
+        txs = extract_transactions(h)
+        if not txs:
+            continue
+
+        for tx in txs:
+            shares = tx.get("shares")
+            price = tx.get("price")
+            owner = tx.get("owner") or "Unknown Buyer"
+            if shares is None or price is None:
+                continue
+            if price < MIN_PRICE or price > MAX_PRICE:
+                continue
+            amount = shares * price
+            if amount < MIN_AMOUNT_USD:
+                continue
+
+            raw_key = f"{filing_url}|{owner}|{shares}|{price}"
+            key = hashlib.sha256(raw_key.encode()).hexdigest()
+            if not seen_insert(conn, key):
+                continue
+
+            amount_str = f"${amount:,.0f}"
+            msg = f"{company} ({ticker}) — {amount_str}\nBuyer: {owner}\nForm: {form_type}"
+            if filing_url:
+                msg += f"\nLink: {filing_url}"
+            send_telegram(msg)
+            logger.info("Sent alert: %s", msg)
+            sent += 1
+    return sent
+
+def main_loop():
+    conn = init_db()
+    logger.info("Starting DidurAnalyticBot. Interval %s seconds", CHECK_INTERVAL_SECONDS)
+    last_checked = datetime.now(timezone.utc) - timedelta(minutes=31)
+    while True:
+        try:
+            since_dt = last_checked
+            data = sec_api_query()
+            hits = data.get("hits", {}).get("hits", [])
+            process_hits(hits, since_dt, conn)
+            last_checked = datetime.now(timezone.utc)
+        except Exception as e:
+            logger.exception("Error in main loop: %s", e)
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+if __name__ == "__main__":
+    main_loop()
